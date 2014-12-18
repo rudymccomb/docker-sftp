@@ -8,9 +8,10 @@
 
 set -e
 
+echo -e >&2 '\nRunning helper script ...\n'
+
 : ${SFTP_USER:=sftp1}
-: ${SFTP_UID:=2001}
-: ${SFTP_LOG_LEVEL:=INFO}
+: ${SFTP_UID:=1000}
 
 # Edit settings in relevant config files
 set_config() {
@@ -20,48 +21,52 @@ set_config() {
         sed -ri "s|($key).*|\1 $value|g" $config_file
     fi
 }
-
 config_file="$CONF_SSH/sshd_config"
-set_config 'LogLevel' "$SFTP_LOG_LEVEL"
 
 : ${SFTP_DATA_DIR:=/data/sftp}
 
-# Check for the existance of the default, or a specified, data volume.
-echo >&2 'Searching for mounted data volumes...'
-if ! [ -e $SFTP_DATA_DIR ]; then
-	: ${SFTP_CHROOT:=/chroot}
-	echo >&2 'Warning: data volume not found!'
-	echo >&2 ' Did you forget --volumes-from data-container or -v /path/sftp:/data/sftp ?'
-	echo >&2 ' If you are aware of how docker volumes work and how to store data, ignore this.'
+#TODO Add more robust way of detecting a volume, compared to a simple directory.
+
+if [ ! -d $SFTP_DATA_DIR ]; then
+	SFTP_DATA_DIR="/"
+	SFTP_CHROOT="/chroot"
+	if [ ! -f /firstrun ]; then
+		echo >&2 'Notice: data volume not found! - skipping ...'
+		echo >&2 '  Data is important. Make sure you have read & understood "Managing Data in Containers",'
+		echo >&2 '  in the official docker documentation. Examples tailored to this container may be found in the README.'
+	fi
 else
 	# Set chroot to data volume container
-	: ${SFTP_CHROOT:=$SFTP_DATA_DIR/chroot}
+	SFTP_CHROOT="$SFTP_DATA_DIR/chroot"
 	set_config 'ChrootDirectory' "$SFTP_CHROOT"
-	# If no old data exist on volume, transfer persistant data.
-	if [ -e $SFTP_DATA_DIR/etc/ssh ]; then
-		echo >&2 'Data volume found! But data already exists - skipping...'
+	# If no old data exist on volume, transfer persistant data
+	if [ -e ${SFTP_DATA_DIR}${CONF_SSH} ]; then
+		echo >&2 'Notice: data volume found, but data is already present! - linking ...'
 	else
-		echo >&2 'Data volume found! - copying now...'
+		echo >&2 'Data volume found! - copying now ...'
 		mkdir -p ${SFTP_DATA_DIR}${CONF_SSH}
 		cp -ax $CONF_SSH/* ${SFTP_DATA_DIR}${CONF_SSH}/
-		echo >&2 "Complete! Persistant data has successfully been copied to $SFTP_DATA_DIR."
+		echo >&2 "Success! Persistant data transfered to $SFTP_DATA_DIR."
 	fi
 	# Symlink ssh config and keys to data volume
 	rm $CONF_SSH/*
 	ln -s ${SFTP_DATA_DIR}${CONF_SSH}/* ${CONF_SSH}/
+	#TODO More robust checking that data is truly copied and all links have been made.
 fi
 
-: ${SFTP_HOME:=$SFTP_CHROOT/share}
+#TODO Check for existance of $SFTP_PUB_KEY in %h/.ssh and add to %h/.ssh/authorized_keys.
+# Only alternative, is adding more files to sshd_config AuthorizedKeysFile, but this does not scale well.
 
-# Create and setup chroot and sftp home
-mkdir -p $SFTP_HOME && chmod 555 $SFTP_CHROOT
-chmod 775 $SFTP_HOME && chmod g+s $SFTP_HOME
-chgrp sftpusers $SFTP_HOME
+# Create the chroot directory
+mkdir -p $SFTP_CHROOT && chmod 555 $SFTP_CHROOT
 
-# Check not only for existance of user, but if either username or uid is in use.
-CHECK1=$(getent passwd $SFTP_USER > /dev/null; echo $?)
-CHECK2=$(getent passwd $SFTP_UID > /dev/null; echo $?)
+# Separate the user input syntax into arrays
+IFS=';' read -a users <<< "$SFTP_USER"
+IFS=';' read -a passwords <<< "$SFTP_PASS"
+IFS=';' read -a uids <<< "$SFTP_UID"
+IFS=';' read -a gids <<< "$SFTP_GID"
 
+<<<<<<< HEAD
 # Check for conflicts, then do user setup.
 if [ $CHECK1 -eq 0 -o $CHECK2 -eq 0 ]; then
 	echo >&2 'Warning: a conflict in the user setup detected! - skipping...'
@@ -75,24 +80,78 @@ fi
 	if [ -z $SFTP_PASS ]; then SFTP_PASS=`pwgen -scnB1 12`; fi
 	echo $SFTP_PASS > sftp_pass; chmod 600 sftp_pass
 	echo "$SFTP_USER:$SFTP_PASS" | chpasswd && unset SFTP_PASS
+=======
+# Run user setup loop
+n=0
+for i in "${users[@]}"; do
+	user="${users[n]}"
+	pass="${passwords[n]}"
+	uid="${uids[n]}"
+	gid="${gids[n]}"
 
+	useraddParams="-M -N -d /$user -s /usr/sbin/nologin"
+
+	if [ -z "$pass" -o "$pass" == "random" ]; then
+		pass=`cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 12 | head -n 1 | grep -i '[a-zA-Z0-9]'`
+	fi
+
+	if [ -n "$uid" ]; then
+		useraddParams="$useraddParams -o -u $uid"
+	fi
+
+	if [ -n "$gid" ]; then
+		useraddParams="$useraddParams -g $gid"
+		groupaddParams="-g $gid"
+	fi
+>>>>>>> beta
+
+	groupCheck=$(getent group $gid > /dev/null; echo $?)
+	if [ $groupCheck -ne 0 ]; then
+		groupadd $groupaddParams "$gid"
+	fi
+
+	userCheck=$(getent passwd $uid > /dev/null; echo $?)
+	if [ $userCheck -ne 0 ]; then
+		useradd $useraddParams "$user"
+		mkdir -p $SFTP_CHROOT/$user
+	fi
+
+	chown root:root $SFTP_CHROOT/$user
+	chmod 755 $SFTP_CHROOT/$user
+
+	# Checks if passwords have been set, using
+	if [ ! -f /sftp_pass ]; then
+		echo "$user:$pass" | chpasswd $chpasswdParams
+		echo "$user:$pass" >> sftp_pass; chmod 600 sftp_pass
+	fi
+
+	n=$(($n+1))
+done
+
+if [ ! -f /firstrun ]; then
 	# Echo quickstart guide to logs
 	echo
 	echo '================================================================================='
 	echo 'Your sftp container is now ready to use!'
 	echo
-	echo 'Login to your new sftp container with these credentials:'
-	echo "Username: $SFTP_USER"
-	echo
-	echo 'For security reasons passwords are not listed here.'
-	echo 'To get the password run this:'
+	echo 'For security reasons the user credentials are not listed here.'
+	echo 'To get the passwords run this:'
 	echo "docker cp some-container:/sftp_pass ."
 	echo
 	echo 'For more information, see the official README.md'
 	echo 'Link: http://registry.hub.docker.com/u/asavartzeth/sftp/'
 	echo 'Link: http://github.com/AsavarTzeth/docker-sftp/'
 	echo '================================================================================='
+<<<<<<< HEAD
+=======
+	echo
+fi
+>>>>>>> beta
 
-echo "Deployment completed!"
+echo -e 'Runtime helper script finished!'
+echo -e 'Running /usr/sbin/sshd ...\n'
+
+# Used as identifier for first-run-only stuff
+touch /firstrun
 
 exec "$@"
